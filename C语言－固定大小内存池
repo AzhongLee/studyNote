@@ -1,0 +1,179 @@
+//
+//  memorypool.c
+//  GDAMapLib
+//
+//  Created by changwei.guo on 16/11/4.
+//  Copyright © 2016年 auto. All rights reserved.
+//
+#include <stdlib.h>
+#include <string.h>
+#include "memorypool.h"
+#define ALIGN4(align)    (((align) + 3) & (~3))
+
+// memory block
+typedef struct tamemoryblock {
+    int	allcount;		/* all unit counts */
+    int	freecount;		/* free unit counts */
+    int	firstindex;     /* current free unit */
+    struct tamemoryblock *next;	/* link to next block */
+    char	data[1];	/* datapart */
+}memoryblock;
+
+// memory pool
+typedef struct tagmemorypool {
+    memoryblock	*block;     /* block linker */
+    int			unitsize;	/* unit size */
+    int			initsize;	/* unit count */
+    int			stepsize;	/* unit count to step up */
+}memorypool;
+
+// create one block
+memoryblock* mempool_createblock(int allcount, int unitsize)
+{
+    int i;
+    char *p;
+    /* malloc memeory block for first one */
+    memoryblock *block = (memoryblock*)malloc(allcount * unitsize + sizeof(memoryblock));     if (block != 0)
+    {
+        block->allcount = allcount;
+        block->freecount = allcount;
+        block->firstindex = 0;
+        block->next      = 0;
+        
+        /* create free link table */
+        p = block->data;
+        for (i = 1; i < allcount; i++)
+        {
+            *((int*)p) = i;
+            p += unitsize;
+        }
+    }
+    return block;
+}
+
+// init memory pool
+int mempool_init(memorypool *pMemPool, int initsize, int unitsize, int stepsize)
+{
+    int ret = 1;
+    memoryblock *block = 0;
+    // init memory pool parameterinfo
+    pMemPool->block    = 0;
+    pMemPool->initsize = initsize;      //count of memory block
+    pMemPool->unitsize = ALIGN4(unitsize);  // size of each block
+    pMemPool->stepsize = stepsize;  // count to step up
+    
+    if (initsize > 0)
+    {
+        /* create first block memory */
+        block = mempool_createblock(pMemPool->initsize, pMemPool->unitsize);
+        if (block == 0)
+        {
+            ret = 0;
+        }
+        else
+        {
+            pMemPool->block = block;
+        }
+    }
+    
+    return ret;
+}
+
+//get one unit from pool
+void* mempool_malloc(memorypool *pMemPool)
+{
+    char *pFree = 0;
+    memoryblock *block = 0;
+    
+    /* find the block which has free unit  */
+    block = pMemPool->block;
+    while (block && !block->freecount)
+    {
+        block = block->next;
+    }
+    
+    if (block == 0)
+    {
+        /* if step up is not used */
+        if (!pMemPool->stepsize)
+        {
+            return 0;
+        }
+        /* create one new memory block  */
+        block = mempool_createblock(pMemPool->stepsize, pMemPool->unitsize);
+        if (block != 0)
+        {
+            if (pMemPool->block == 0)
+            {
+                pMemPool->block = block;
+            }
+            else
+            {
+                block->next = pMemPool->block;
+                pMemPool->block = block;
+            }
+        }
+    }
+    /* find the unit one for used and set firstindex to the next free unit */
+    if (block != 0)
+    {
+        pFree = block->data + (block->firstindex * pMemPool->unitsize);
+        block->firstindex = *((int*)pFree);
+        block->freecount--;
+    }
+    
+    return (void*)pFree;
+}
+
+// free one unit backto pool
+void mempool_free(memorypool *pMemPool, void *p)
+{
+    memoryblock *block;
+    /* find the memory block which *p  belong to  */
+    block = pMemPool->block;
+    while (block != 0)
+    {
+        if (((unsigned long)block->data <= (unsigned long)p) && ((unsigned long)p < ((unsigned long)block->data + block->allcount * pMemPool->unitsize)))
+        {
+            break;
+        }
+        block = block->next;
+    }
+    /* set firstindex value to the free one unit */
+    if (block != 0)
+    {
+        *((int*)p) = block->firstindex;
+        block->firstindex = (int)(((unsigned long)p - (unsigned long)block->data) / pMemPool->unitsize);
+        block->freecount++;
+        
+        if (block->freecount == block->allcount)
+        {
+            /* recover memory */
+        }
+    }
+}
+
+//uninit memory pool
+void mempool_uninit(memorypool *pMemPool)
+{
+    memoryblock *pBlock, *pNext;
+    int totalunit = 0;
+    int availunit = 0;
+    int totalmemory = 0;
+    /* recover all memory block */
+    pBlock = pMemPool->block;
+    while (pBlock != 0)
+    {
+        /* 不允许内存增长 */
+        availunit += pBlock->freecount;
+        totalunit += pBlock->allcount;
+        totalmemory += pBlock->allcount * pMemPool->unitsize + sizeof(memoryblock);
+        
+        pNext = pBlock->next;
+        free(pBlock);
+        pBlock = pNext;
+    }
+    
+    memset(pMemPool, 0, sizeof(memorypool));
+}
+

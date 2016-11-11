@@ -1,0 +1,383 @@
+
+/*
+*   为了减少从系统堆中申请内存的次数，保证内存的整体稳定。内存申请释放应遵循如下基本原则:
+*    1、各模块应根据用途规划本模块内存整体策略。
+*    2、每个用途分配一块内存。
+*    3、大内存使用内存分配器再分配给具体应用。
+*
+*    分配器分为：顺序内存分配器和随机内存分配器。
+*    ⊙顺序内存分配器适合每次应用都是数据重新刷新的，比如图面显示数据，每帧画面数据都不一样，故每次都需从头刷新。
+*    这种分配方式无需提供释放接口。内存申请简单，效率高。
+*    ⊙随机内存分配器类似于系统HeapAlloc功能。适合管理内存生命周期不一致的情况。当内存不够的时候，可以重新初始化。
+*    这种分配方式实现复杂，效率低。同时需要释放内存。
+*    ⊙随机内存会浪费一定的内存来管理内存分配，每申请一块内存会额外占用8个字节的空间，同时内部会对大小进行8字节对
+*      齐。且固定会占用8个字节作为内部使用。故内存实际空间为：8 + ALIGN8(sz1 + 8) + ALIGN8(sz2 + 8) + ... + ALIGN8(szn + 8)
+*    ⊙对齐8字节会浪费内存，理想情况0字节，最坏情况7字节，假定分配次数为N，那么：
+*      理想情况：8 + N * 8 + 实际大小，最坏情况：8 + N * (8 + 7) + 实际大小
+*    ⊙每次内存申请大小都会强制>=16字节，不足16字节，内部仍按16字节申请；
+*    ⊙分配器由外部管理。
+*
+*/
+
+#define NULL 0
+/**************************************************************************
+ *  顺序内存分配器
+ *************************************************************************/
+
+typedef struct taSequenceAllocator {
+    unsigned int nTotalSize;
+    unsigned int nFreeSize;
+    unsigned char *pHead;
+    unsigned char *pCurPtr;
+} SequenceAllocator;
+
+
+void mem_SeqAllocator_Init(SequenceAllocator *pAllocator, unsigned char *pMem, unsigned int nSize)
+{
+    pAllocator->nTotalSize = nSize;
+    pAllocator->nFreeSize  = pAllocator->nTotalSize;
+    pAllocator->pHead      = pMem;
+    pAllocator->pCurPtr    = pAllocator->pHead;
+}
+
+void mem_SeqAllocator_Rewind(SequenceAllocator* pAllocator)
+{
+    pAllocator->nFreeSize  = pAllocator->nTotalSize;
+    pAllocator->pCurPtr    = pAllocator->pHead;
+}
+
+void* mem_SeqAllocator_Malloc(SequenceAllocator* pAllocator, unsigned int nSize)
+{
+    void *p = NULL;
+    
+    nSize = ((nSize + 3) >> 2) << 2;    /* Align 4 bytes */
+    if (pAllocator->nFreeSize >= nSize)
+    {
+        p = (void*)pAllocator->pCurPtr;
+        pAllocator->pCurPtr += nSize;
+        pAllocator->nFreeSize -= nSize;
+    }
+    
+    return p;
+}
+
+/**************************************************************************
+ *  随机内存分配器
+ *************************************************************************/
+
+/*  Basic overhead for each malloc'ed chunk */
+typedef struct tagAllocatorChunk {
+    unsigned int            size;    /* Size in bytes, including overhead. Or'ed with INUSE if in use. */
+    struct tagAllocatorChunk* fd;    /* float links -- used only if free. */
+    struct tagAllocatorChunk* bk;
+} AllocatorChunk, *PAllocatorChunk;
+
+typedef struct tagAllocatorBin {
+    AllocatorChunk header;        /* dummy list header */
+} AllocatorBin, *PAllocatorBin;
+
+
+#define MCR_MAXBIN 120   /* 1 more than needed for 32 bit addresses */
+typedef struct tagRandomAllocator {
+    void *pHead;
+    AllocatorBin  AMMav[MCR_MAXBIN];
+    unsigned int nTotalSize;
+    /* maximum bin actually used */
+    PAllocatorBin pmalloc_maxbin;
+    unsigned int malloced_mem;    /* 总分配的内存数 */
+    unsigned int freed_mem;        /* 总已释放内存数 */
+    unsigned int n_mallocs;        /* 总分配次数     */
+    unsigned int n_frees;        /* 总释放次数     */
+    unsigned int peak_mem;        /* 内存峰值       */
+} RandomAllocator, *PRandomAllocator;
+
+#define SIZE_SZ (sizeof(int))
+#define MINSIZE (sizeof(AllocatorChunk) + sizeof(unsigned int*)/*SIZE_SZ*/) /* MUST == 16! */
+#define MALLOC_MIN_OVERHEAD       (SIZE_SZ + SIZE_SZ)
+#define MALLOC_ALIGN_MASK         (MALLOC_MIN_OVERHEAD - 1)
+
+#define MINSIZE (sizeof(AllocatorChunk) + sizeof(unsigned int*)/*SIZE_SZ*/) /* MUST == 16! */
+
+/* maintaining INUSE via size field */
+#define MCR_inuse(p)       ((p)->size & (unsigned int)MCR_INUSE)
+#define MCR_set_inuse(p)   ((p)->size |= (unsigned int)MCR_INUSE)
+#define MCR_clear_inuse(p) ((p)->size &= (unsigned int)(~MCR_INUSE))
+
+/* return ptr to next physical AllocatorChunk */
+#define MCR_next_chunk(p) ((PAllocatorChunk)((char*)(p) + (p)->size))
+
+/* return ptr to previous physical AllocatorChunk */
+#define MCR_prev_chunk(p) ((PAllocatorChunk)((char*)(p)-((((int*)(p))[-1]) & ~(MCR_INUSE))))
+
+/* conversion from malloc headers to user pointers */
+#define MCR_chunk2mem(p) (void*)((char*)(p) + SIZE_SZ)
+
+/* conversion from user pointer to malloc headers */
+#define MCR_mem2chunk(mem) (PAllocatorChunk)((char*)(mem) - SIZE_SZ)
+
+/* take a chunk off a list */
+#define MCR_unlink(p) (p)->fd->bk = (p)->bk; (p)->bk->fd = (p)->fd;
+
+/* size field or'd with INUSE when in use */
+#define MCR_INUSE  0x1
+
+static unsigned int ran_request2size(unsigned int request);
+static PAllocatorBin ran_size2bin(PRandomAllocator pPool, unsigned int sz);
+static void ran_set_size(PAllocatorChunk p, unsigned int sz);
+static void ran_split(PRandomAllocator pPool, PAllocatorChunk p, unsigned int offset);
+static void ran_consollink(PRandomAllocator pPool, PAllocatorChunk p);
+
+/* pad request bytes into a usable size */
+unsigned int ran_request2size(unsigned int request)
+{
+    request = (request + (unsigned int)(MALLOC_MIN_OVERHEAD + MALLOC_ALIGN_MASK)) & (unsigned int)~MALLOC_ALIGN_MASK;
+    if (request < MINSIZE)
+    {
+        request = MINSIZE;
+    }
+    return request;
+    //     return  (request == 0u) ?  (unsigned int)MINSIZE :
+    //         ((request + (unsigned int)(MALLOC_MIN_OVERHEAD + MALLOC_ALIGN_MASK)) & (unsigned int)~MALLOC_ALIGN_MASK);
+}
+
+/*
+ indexing into bins
+ */
+PAllocatorBin ran_size2bin(PRandomAllocator pPool, unsigned int sz)
+{
+    PAllocatorBin b = pPool->AMMav;
+    while (sz >= (unsigned int)(MINSIZE * 2)) { b += 4; sz >>= 1; } /* find power of 2 */
+    b += (sz - MINSIZE) / sizeof(unsigned int*)/*>> 2*/;                         /* find quadrant */
+    return b;
+}
+
+/* place size at front and back of chunk */
+void ran_set_size(PAllocatorChunk p, unsigned int sz)
+{
+    *((int*)((char*)(p) + (sz - SIZE_SZ))) = sz;
+    p->size = sz;
+}
+
+/* split a chunk and place on the back of a list */
+void ran_split(PRandomAllocator pPool, PAllocatorChunk p, unsigned int offset)
+{
+    unsigned int room = p->size - offset;
+    if (room >= MINSIZE)
+    {
+        PAllocatorBin   bn = ran_size2bin(pPool, room);           /* new bin */
+        PAllocatorChunk h  = &(bn->header);                       /* its head */
+        PAllocatorChunk b  = h->bk;                           /* old back element */
+        PAllocatorChunk t = (PAllocatorChunk)((char*)(p) + offset); /* remaindered chunk */
+        
+        /* set size */
+        *((int*)((char*)(t) + (room - SIZE_SZ))) = room;
+        t->size = room;
+        
+        /* link up */
+        t->bk = b;  t->fd = h;  h->bk = t; b->fd = t;
+        
+        /* adjust size of chunk to be returned */
+        p->size = offset;
+        *((int*)((char*)(p) + (offset  - SIZE_SZ))) = offset;
+        
+    }
+}
+
+/* place a consolidated chunk on the back of a list */
+/* like above, except no split */
+void ran_consollink(PRandomAllocator pPool, PAllocatorChunk p)
+{
+    PAllocatorBin   bn = ran_size2bin(pPool, p->size);
+    PAllocatorChunk h  = &(bn->header);
+    PAllocatorChunk b  = h->bk;
+    
+    p->bk = b;  p->fd = h;  h->bk = p; b->fd = p;
+}
+
+/*   Finally, the user-level functions  */
+void mem_RanAllocator_Init(RandomAllocator *pAllocator, unsigned char *pMem, unsigned int nSize)
+{
+    PAllocatorChunk h;
+    PAllocatorChunk b;
+    PAllocatorChunk p;
+    unsigned long long memAddr1, memAddr2;
+    unsigned int i,sz;
+    int *ip;
+
+    /* Shouldn't be necessary, but better to be safe */
+#if 0
+    if (size < (unsigned int)MINIMAL_POOL_SIZE)
+    {
+        return NULL;
+    }
+#endif
+
+    pAllocator->pmalloc_maxbin = pAllocator->AMMav;
+
+    /* Make sure that 8 bytes aligned*/
+    memAddr1 = (unsigned long long)pMem;
+    memAddr2 = memAddr1;
+    memAddr1=( (memAddr1 + 7u) >>3 ) << 3;
+
+    pAllocator->pHead = (void*)memAddr1;
+    nSize = nSize - (unsigned int)(memAddr1 - memAddr2);
+
+    for (i = 0u; i < (unsigned int)MCR_MAXBIN; i++)
+    {    
+        pAllocator->AMMav[i].header.size = 0u;
+        pAllocator->AMMav[i].header.bk = &(pAllocator->AMMav[i].header);
+        pAllocator->AMMav[i].header.fd = &(pAllocator->AMMav[i].header);
+    }
+
+    /* 
+    Create the first chunk for malloc
+    */
+    sz = nSize - (SIZE_SZ + SIZE_SZ);
+    pAllocator->nTotalSize = sz;
+
+    /* Mark the front as in use to prevent merging. */
+    ip = (int*)pAllocator->pHead;
+    *ip = SIZE_SZ | MCR_INUSE;
+
+    ++ip;
+    p = (PAllocatorChunk)(ip);
+    ran_set_size(p, sz);
+
+    /* place the chunk on the back of a list*/
+    pAllocator->pmalloc_maxbin = ran_size2bin(pAllocator, sz);
+    h  = &(pAllocator->pmalloc_maxbin->header);
+    b  = h->bk;
+
+    p->bk = b;
+    p->fd = h;
+    h->bk = p;
+    b->fd = p;
+
+    /* Mark the back as in use to prevent merging. */
+    ip = (int*)( (char*)p + p->size );
+    *ip = SIZE_SZ | MCR_INUSE;
+
+    pAllocator->malloced_mem=0u;
+    pAllocator->freed_mem=0u;
+    pAllocator->n_mallocs=0u;
+    pAllocator->n_frees=0u;
+    pAllocator->peak_mem = 0u;
+}
+
+void* mem_RanAllocator_Malloc(RandomAllocator *pAllocator, unsigned int nSize)
+{
+    unsigned int nb;  /* padded request size */
+    PAllocatorBin      b;         /* corresponding bin */
+    PAllocatorChunk    header;             /* head of its list */
+    PAllocatorChunk    p;               /* chunk traverser */
+    int found = 0;
+    void* pvRet = NULL;
+
+    if ((NULL != pAllocator) && (0u != nSize))
+    {
+        nb  = ran_request2size(nSize);  /* padded request size */
+        b   = ran_size2bin(pAllocator, nb);         /* corresponding bin */
+        header  = &(b->header);             /* head of its list */
+        p   = header->fd; 
+
+        /* Try a (near) exact match in own bin */
+
+        while (p != header)
+        {
+            if (p->size >= nb) 
+            {
+                found = 1;
+                break;
+            }
+            p = p->fd;
+        }
+
+        /*  Scan bigger bins for a victim */
+        if (found == 0)
+        {
+            ++b;
+            while (b <= pAllocator->pmalloc_maxbin)
+            {
+                p = b->header.bk;
+                if (p != &(b->header))    /* no need to check size */
+                {
+                    found = 1;
+                    break;
+                }
+                ++b;
+            }
+        }
+
+        if (found == 1)
+        {
+            /* Use what we found */
+            MCR_unlink(p);
+            ran_split(pAllocator, p, nb);
+
+            ++pAllocator->n_mallocs;
+            pAllocator->malloced_mem += p->size;
+
+            if (pAllocator->peak_mem < (pAllocator->malloced_mem-pAllocator->freed_mem))
+            {
+                pAllocator->peak_mem = pAllocator->malloced_mem - pAllocator->freed_mem;
+            }
+
+            MCR_set_inuse(p);
+
+            pvRet = MCR_chunk2mem(p);
+        }
+        else
+        {
+            /* No enough space.*/
+        }
+    }
+
+    return pvRet;
+}
+
+void mem_RanAllocator_Free(RandomAllocator *pAllocator, void* mem)
+{
+    bool bBadMem = false;
+
+    if (mem != NULL)
+    {
+        PAllocatorChunk p = MCR_mem2chunk(mem);
+        PAllocatorChunk t;
+
+        if (((unsigned long)pAllocator->pHead > (unsigned long)p) || ((unsigned long)p > ((unsigned long)pAllocator->pHead + pAllocator->nTotalSize)))
+        {
+            bBadMem = true;
+        }
+        if (0u == (p->size & (unsigned int)MCR_INUSE))
+        {
+            bBadMem = true;
+        }
+
+        if (false == bBadMem)
+        {
+            MCR_clear_inuse(p);
+
+            ++pAllocator->n_frees;
+            pAllocator->freed_mem += p->size;
+
+            /* Consolidate the freed chunks and place it on the related list.*/
+            t = MCR_prev_chunk(p);
+            while (0u == MCR_inuse(t)) /* consolidate backward */
+            {
+                MCR_unlink(t);
+                ran_set_size(t, t->size + p->size);
+                p = t;
+                t = MCR_prev_chunk(p);
+            }
+            t = MCR_next_chunk(p);
+            while (0u == MCR_inuse(t)) /* consolidate forward */
+            {
+                MCR_unlink(t);
+                ran_set_size(p, p->size + t->size);
+                t = MCR_next_chunk(p);
+            }
+
+            ran_consollink(pAllocator, p); 
+        }
+    }
+}
